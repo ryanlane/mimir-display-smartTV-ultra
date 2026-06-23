@@ -27,6 +27,7 @@ import threading
 import time
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 import requests
 from dotenv import load_dotenv
 
@@ -160,16 +161,21 @@ def push_image(image_bytes: bytes) -> bool:
 class DisplayClient:
     def __init__(self, hostname: str):
         self.hostname = hostname
-        self.topic_cmd = f"mimir/{hostname}/cmd"
-        self.topic_status = f"mimir/{hostname}/status"
-        self.topic_evt = f"mimir/{hostname}/evt"
+        self.topic_cmd       = f"mimir/{hostname}/cmd"
+        self.topic_status    = f"mimir/{hostname}/status"
+        self.topic_heartbeat = f"mimir/{hostname}/heartbeat"
+        self.topic_evt       = f"mimir/{hostname}/evt"
         self._mqtt: mqtt.Client | None = None
         self._connected = threading.Event()
 
     # ── MQTT lifecycle ────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        client = mqtt.Client(client_id=self.hostname, protocol=mqtt.MQTTv311)
+        client = mqtt.Client(
+            callback_api_version=CallbackAPIVersion.VERSION2,
+            client_id=self.hostname,
+            protocol=mqtt.MQTTv311,
+        )
         if MQTT_USERNAME:
             client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
         client.on_connect    = self._on_connect
@@ -185,17 +191,17 @@ class DisplayClient:
         client.loop_start()
         self._connected.wait(timeout=10)
 
-    def _on_connect(self, client, userdata, flags, rc) -> None:
-        if rc != 0:
-            log.error("MQTT connect failed rc=%d", rc)
+    def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
+        if reason_code != 0:
+            log.error("MQTT connect failed rc=%s", reason_code)
             return
         log.info("MQTT connected to %s:%d", MQTT_BROKER, MQTT_PORT)
         client.subscribe(self.topic_cmd, qos=1)
         self._connected.set()
         self._publish_status("online")
 
-    def _on_disconnect(self, client, userdata, rc) -> None:
-        log.warning("MQTT disconnected (rc=%d) — will auto-reconnect", rc)
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties) -> None:
+        log.warning("MQTT disconnected (rc=%s) — will auto-reconnect", reason_code)
         self._connected.clear()
 
     # ── Command handling ──────────────────────────────────────────────────────
@@ -248,23 +254,40 @@ class DisplayClient:
 
     # ── Presence ──────────────────────────────────────────────────────────────
 
+    def _now_iso(self) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     def _publish_status(self, status: str) -> None:
         payload = {
             "device_id": self.hostname,
             "hostname": self.hostname,
             "status": status,
-            "time": str(int(time.time())),
+            "timestamp": self._now_iso(),
             "res": [DISPLAY_W, DISPLAY_H],
             "ori": "square",
+            "registration_state": "finalized",
+        }
+        if self._mqtt:
+            self._mqtt.publish(self.topic_status, json.dumps(payload), retain=True)
+
+    def _publish_heartbeat(self) -> None:
+        payload = {
+            "device_id": self.hostname,
+            "hostname": self.hostname,
+            "timestamp": self._now_iso(),
             "registration_state": "finalized",
             "cap": {
                 "res": [DISPLAY_W, DISPLAY_H],
                 "ori": "square",
                 "client_version": CLIENT_VERSION,
+                "redis_distribution": False,
+                "content_claiming": False,
             },
+            "res": [DISPLAY_W, DISPLAY_H],
+            "rot": 0,
         }
         if self._mqtt:
-            self._mqtt.publish(self.topic_status, json.dumps(payload), retain=True)
+            self._mqtt.publish(self.topic_heartbeat, json.dumps(payload))
 
     def _publish_event(self, evt_type: str, **fields) -> None:
         doc = {"type": evt_type, "t": str(int(time.time()))}
@@ -275,6 +298,7 @@ class DisplayClient:
     def heartbeat_loop(self) -> None:
         while True:
             self._publish_status("online")
+            self._publish_heartbeat()
             time.sleep(HEARTBEAT_INTERVAL)
 
 
