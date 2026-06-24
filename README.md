@@ -75,7 +75,7 @@ Access the device's built-in web UI at `http://<DEVICE_IP>/` to configure WiFi, 
 
 ### WSL2 note
 
-WSL2 can reach devices on the local network directly if mirrored networking is enabled. If `ping 192.168.1.44` works in WSL, no extra setup is needed. For USB serial access to other ESP32 boards, see [`mimir-display-esp32/README.md`](../mimir-display-esp32/README.md).
+WSL2 can reach devices on the local network directly if mirrored networking is enabled. If `ping 192.168.1.x` works in WSL, no extra setup is needed. For USB serial access to other ESP32 boards, see [`mimir-display-esp32/README.md`](../mimir-display-esp32/README.md).
 
 ---
 
