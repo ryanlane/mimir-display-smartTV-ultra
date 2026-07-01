@@ -40,8 +40,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MIMIR_API         = os.getenv("MIMIR_API", "http://localhost:8000")
-MQTT_BROKER       = os.getenv("MQTT_BROKER", "localhost")
+MIMIR_API         = os.getenv("MIMIR_API", "http://mimir.local:8000")
+MQTT_BROKER       = os.getenv("MQTT_BROKER", "mimir.local")
 MQTT_PORT         = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USERNAME     = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD     = os.getenv("MQTT_PASSWORD") or None
@@ -123,6 +123,41 @@ def ensure_registered() -> dict:
     return register_with_mimir()
 
 
+# ── Assignment recovery ───────────────────────────────────────────────────────
+
+def fetch_current_assignment(display_id: str) -> dict | None:
+    """Ask Mimir what scene is currently assigned, and the last image rendered
+    for it, so we can repaint immediately after a restart/reconnect instead of
+    waiting for the next live scene-change event."""
+    try:
+        r = requests.get(f"{MIMIR_API}/api/displays/{display_id}", timeout=10)
+        r.raise_for_status()
+        assigned = r.json().get("assignedSceneId")
+    except Exception as exc:
+        log.warning("Could not fetch display record: %s", exc)
+        return None
+
+    if not assigned:
+        return None
+
+    scene_id = assigned.get("id")
+    subchannel_id = assigned.get("subchannelId")
+    params = {"subchannel_id": subchannel_id} if subchannel_id else None
+    try:
+        r = requests.get(
+            f"{MIMIR_API}/api/displays/{display_id}/scenes/{scene_id}/last-image",
+            params=params,
+            timeout=10,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        log.warning("Could not fetch last image for scene %s: %s", scene_id, exc)
+        return None
+
+
 # ── SmallTV HTTP API ──────────────────────────────────────────────────────────
 
 def clear_all_images() -> None:
@@ -159,8 +194,9 @@ def push_image(image_bytes: bytes) -> bool:
 # ── MQTT client ───────────────────────────────────────────────────────────────
 
 class DisplayClient:
-    def __init__(self, hostname: str):
+    def __init__(self, hostname: str, display_id: str):
         self.hostname = hostname
+        self.display_id = display_id
         self.topic_cmd       = f"mimir/{hostname}/cmd"
         self.topic_status    = f"mimir/{hostname}/status"
         self.topic_heartbeat = f"mimir/{hostname}/heartbeat"
@@ -199,6 +235,7 @@ class DisplayClient:
         client.subscribe(self.topic_cmd, qos=1)
         self._connected.set()
         self._publish_status("online")
+        threading.Thread(target=self._sync_current_assignment, daemon=True).start()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties) -> None:
         log.warning("MQTT disconnected (rc=%s) — will auto-reconnect", reason_code)
@@ -226,8 +263,26 @@ class DisplayClient:
             log.debug("Unhandled command type: %s", cmd_type)
 
     def _handle_display_image(self, cmd: dict) -> None:
-        image_url    = cmd.get("image_url", "")
+        image_url     = cmd.get("image_url", "")
         assignment_id = cmd.get("assignment_id", "")
+        self._fetch_and_push(image_url, assignment_id)
+
+    def _sync_current_assignment(self) -> None:
+        """Called on every (re)connect so the device repaints its assigned
+        scene immediately instead of showing stale content until the next
+        live scene-change command arrives."""
+        record = fetch_current_assignment(self.display_id)
+        if not record:
+            log.info("No current assignment/image to sync")
+            return
+        image_url     = record.get("image_url", "")
+        assignment_id = record.get("assignment_id", "")
+        if not image_url:
+            return
+        log.info("Syncing current assignment on connect")
+        self._fetch_and_push(image_url, assignment_id)
+
+    def _fetch_and_push(self, image_url: str, assignment_id: str) -> None:
         log.info("Fetching image from %s", image_url)
         try:
             r = requests.get(image_url, timeout=30)
@@ -311,6 +366,7 @@ def main() -> None:
 
     reg = ensure_registered()
     hostname = reg["hostname"]
+    display_id = reg["display_id"]
 
     log.info("Clearing demo images from device")
     try:
@@ -318,7 +374,7 @@ def main() -> None:
     except Exception as exc:
         log.warning("Could not clear images: %s", exc)
 
-    client = DisplayClient(hostname)
+    client = DisplayClient(hostname, display_id)
     log.info("Connecting to MQTT broker %s:%d", MQTT_BROKER, MQTT_PORT)
     client.start()
 
